@@ -85,7 +85,7 @@ def temp_reading():
     return (sorted(candidates, key=sensor_priority) or [("Unavailable", None)])[0]
 
 def gpu_reading():
-    """Run NVIDIA's supported query interface and turn its CSV into a dict."""
+    """Read GPU metrics, preferring NVIDIA and then falling back to AMD."""
     # Keep this list aligned with the command requested for the project.
     query = 'name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw'
     try:
@@ -96,7 +96,29 @@ def gpu_reading():
         if len(parts) < 6: return None, 'Unexpected nvidia-smi output'
         return {'name': parts[0], 'temp': float(parts[1]), 'load': float(parts[2]), 'mem_used': float(parts[3]), 'mem_total': float(parts[4]), 'power': float(parts[5])}, None
     except (OSError, subprocess.SubprocessError, ValueError) as e:
-        return None, str(e)
+        pass
+
+    # AMD's open-source amdgpu driver exposes equivalent values directly in sysfs.
+    for device in sorted((BASE / 'class/drm').glob('card*/device')):
+        if read_text(device / 'vendor') != '0x1002':
+            continue
+        load = read_text(device / 'gpu_busy_percent')
+        used = read_text(device / 'mem_info_vram_used')
+        total = read_text(device / 'mem_info_vram_total')
+        power = read_text(device / 'power1_average')
+        temp = None
+        for sensor in sorted((device / 'hwmon').glob('hwmon*/temp*_input')):
+            raw = read_text(sensor)
+            if raw:
+                temp = float(raw) / 1000
+                break
+        name = read_text(device / 'product_name') or read_text(device / 'device') or 'AMD GPU'
+        # AMD VRAM and power sysfs values are bytes and microwatts respectively.
+        return {'name': name, 'temp': temp, 'load': float(load) if load else None,
+                'mem_used': float(used) / 1024**2 if used else 0,
+                'mem_total': float(total) / 1024**2 if total else 0,
+                'power': float(power) / 1_000_000 if power else None}, None
+    return None, 'No supported NVIDIA or AMD GPU found'
 
 class Gauge(QWidget):
     def __init__(self, title, maximum=100, suffix='%'):
