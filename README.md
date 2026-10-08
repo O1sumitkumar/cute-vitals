@@ -6,6 +6,7 @@ Small native-looking Linux desktop system monitor for KDE/Qt. It refreshes every
 
 - Python 3.10+
 - PySide6 or PyQt6
+- psutil (required for Windows CPU, RAM, and process readings)
 - `nvidia-smi` (optional for NVIDIA cards)
 - Linux's `amdgpu` sysfs interface (used automatically for AMD cards)
 
@@ -14,11 +15,11 @@ On Kubuntu:
 ```bash
 cd /home/conner/Documents/GitHub/cute-vitals
 python3 -m venv .venv
-.venv/bin/pip install PyQt6
+.venv/bin/pip install PyQt6 psutil
 .venv/bin/python cute_vitals.py
 ```
 
-The app reads CPU utilisation from `/proc/stat`, CPU frequency from `/sys/devices/system/cpu`, temperatures from hwmon/thermal sysfs, NVIDIA values from `nvidia-smi`, and AMD values from the kernel's `amdgpu` sysfs interface. ROCm is not required.
+On Windows, install the dependencies with `py -m pip install PyQt6 psutil`, then run `py cute_vitals.py`. The app reads CPU, RAM, frequency, and process data through psutil on Windows, while Linux continues to use `/proc` and sysfs directly. NVIDIA values use `nvidia-smi`; AMD values use the Linux `amdgpu` sysfs interface when available. ROCm is not required for Linux AMD support.
 
 ## What it shows
 

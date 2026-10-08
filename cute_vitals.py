@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-import os, re, subprocess, time
+import os, platform, re, subprocess, time
 from pathlib import Path
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # Try PySide6 first, then fall back to PyQt6. Both provide the Qt widgets used here.
 try:
@@ -24,6 +29,8 @@ def read_text(path):
 
 def cpu_model():
     """Find the human-readable CPU model name from /proc/cpuinfo."""
+    if os.name == 'nt':
+        return platform.processor() or 'CPU'
     for line in (read_text('/proc/cpuinfo') or '').splitlines():
         if line.lower().startswith('model name'):
             return line.split(':', 1)[1].strip()
@@ -31,6 +38,11 @@ def cpu_model():
 
 def ram_reading():
     """Return RAM used and total in MiB using Linux's /proc/meminfo."""
+    if os.name == 'nt':
+        if psutil is None:
+            return None
+        memory = psutil.virtual_memory()
+        return memory.used / 1024**2, memory.total / 1024**2
     values = {}
     for line in (read_text('/proc/meminfo') or '').splitlines():
         key, _, rest = line.partition(':')
@@ -50,6 +62,9 @@ def cpu_stats():
     /proc/stat reports totals since boot. Comparing two samples lets us
     calculate how much of the most recent one-second interval was busy.
     """
+    # Windows does not expose /proc/stat; refresh() uses psutil directly there.
+    if os.name == 'nt':
+        return []
     rows = []
     for line in (read_text('/proc/stat') or '').splitlines():
         p = line.split()
@@ -62,6 +77,16 @@ def cpu_stats():
 
 def temp_reading():
     """Find a sensible CPU temperature from hwmon or thermal-zone sensors."""
+    if os.name == 'nt':
+        if psutil is not None:
+            try:
+                sensors = psutil.sensors_temperatures()
+                candidates = [(label or name, entry.current) for name, entries in sensors.items() for entry in entries if entry.current is not None for label in [entry.label]]
+                if candidates:
+                    return candidates[0]
+            except (AttributeError, OSError):
+                pass
+        return 'Unavailable', None
     candidates = []
     for hw in sorted((BASE / 'class/hwmon').glob('hwmon*')):
         name = read_text(hw / 'name') or ''
@@ -91,10 +116,10 @@ def gpu_reading():
     try:
         # nounits makes the output easier to parse: values arrive as plain numbers.
         p = subprocess.run(['nvidia-smi', f'--query-gpu={query}', '--format=csv,noheader,nounits'], text=True, capture_output=True, timeout=.8)
-        if p.returncode != 0 or not p.stdout.strip(): return None, (p.stderr.strip() or 'nvidia-smi unavailable')
-        parts = [x.strip() for x in p.stdout.splitlines()[0].split(',')]
-        if len(parts) < 6: return None, 'Unexpected nvidia-smi output'
-        return {'name': parts[0], 'temp': float(parts[1]), 'load': float(parts[2]), 'mem_used': float(parts[3]), 'mem_total': float(parts[4]), 'power': float(parts[5])}, None
+        if p.returncode == 0 and p.stdout.strip():
+            parts = [x.strip() for x in p.stdout.splitlines()[0].split(',')]
+            if len(parts) >= 6:
+                return {'name': parts[0], 'temp': float(parts[1]), 'load': float(parts[2]), 'mem_used': float(parts[3]), 'mem_total': float(parts[4]), 'power': float(parts[5])}, None
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         pass
 
@@ -122,6 +147,18 @@ def gpu_reading():
 
 def process_rows():
     """Return the busiest processes using the standard Linux ps utility."""
+    if os.name == 'nt':
+        if psutil is None:
+            return []
+        rows = []
+        for process in psutil.process_iter(['pid', 'name', 'memory_percent', 'memory_info']):
+            try:
+                cpu = process.cpu_percent(None)
+                info = process.info
+                rows.append((str(info['pid']), info['name'] or 'Unknown', cpu, info['memory_percent'] or 0, int((info['memory_info'].rss if info['memory_info'] else 0) / 1024)))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return sorted(rows, key=lambda row: row[2], reverse=True)[:12]
     try:
         # ps already calculates process CPU and memory percentages for us.
         result = subprocess.run(['ps', '-eo', 'pid=,comm=,%cpu=,%mem=,rss=', '--sort=-%cpu'], text=True, capture_output=True, timeout=.5)
@@ -221,12 +258,21 @@ class Window(QMainWindow):
     def refresh(self):
         # The first sample is only a baseline; a percentage needs two samples.
         stats=cpu_stats(); total=core=None
-        if self.prev and stats:
+        if os.name == 'nt' and psutil is not None:
+            # psutil provides the cross-platform equivalent of /proc/stat on Windows.
+            total = psutil.cpu_percent(None)
+            core = psutil.cpu_percent(None, percpu=True)
+        elif self.prev and stats:
             def pct(old,new):
                 # CPU ticks are cumulative. Busy ticks divided by all ticks gives load.
                 dt=new[1]-old[1]; di=new[2]-old[2]; return 100*(dt-di)/dt if dt else 0
             total=pct(self.prev[0],stats[0]); core=[pct(self.prev[i+1],stats[i+1]) for i in range(min(len(stats)-1, os.cpu_count() or 1)) if i+1 < len(self.prev)]
-        self.prev=stats; self.cpu_load.set_value(total); label,temp=temp_reading(); self.cpu_temp.set_value(temp, f'{temp:.1f}°C' if temp is not None else None); mhz=read_text('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'); self.cpu_freq.setText(f'Frequency: {float(mhz)/1000:.0f} MHz' if mhz else 'Frequency: unavailable'); self.cores.setText('Per-core: ' + ('  '.join(f'C{i} {v:.0f}%' for i,v in enumerate(core)) if core else 'warming up…'))
+        self.prev=stats; self.cpu_load.set_value(total); label,temp=temp_reading(); self.cpu_temp.set_value(temp, f'{temp:.1f}°C' if temp is not None else None)
+        if os.name == 'nt' and psutil is not None:
+            frequency = psutil.cpu_freq(); self.cpu_freq.setText(f'Frequency: {frequency.current:.0f} MHz' if frequency else 'Frequency: unavailable')
+        else:
+            mhz=read_text('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'); self.cpu_freq.setText(f'Frequency: {float(mhz)/1000:.0f} MHz' if mhz else 'Frequency: unavailable')
+        self.cores.setText('Per-core: ' + ('  '.join(f'C{i} {v:.0f}%' for i,v in enumerate(core)) if core else 'warming up…'))
         ram=ram_reading(); self.ram.set_value(ram[0]/ram[1]*100 if ram else None, f'{ram[0]:.0f} / {ram[1]:.0f} MiB' if ram else None)
         # GPU metrics are independent of CPU sampling and may temporarily fail.
         gpu,err=gpu_reading();
